@@ -5,6 +5,10 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -37,7 +41,7 @@ jobs:
           git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos.git openwrt
           cd openwrt
           git log -1 --oneline
-          grep -r "LINUX_VERSION-6.12" target/linux/generic/kernel-6.12
+          cat target/linux/generic/kernel-6.12
 
       - name: Update and install feeds
         run: |
@@ -61,7 +65,6 @@ jobs:
           CONFIG_TARGET_IMAGES_GZIP=y
           CONFIG_PACKAGE_kmod-dwmac-motorcomm=y
           CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-app-store=y
           EOF
           make defconfig
           echo "=== 关键配置确认 ==="
@@ -71,38 +74,85 @@ jobs:
             exit 1
           fi
 
+      - name: Pre-check kernel patches
+        run: |
+          cd openwrt
+          set -o pipefail
+          mkdir -p /tmp/prep
+          make -j1 target/linux/prepare V=s 2>&1 | tail -n 120
+          echo "== 内核补丁应用完成，未发现 FAILED =="
+
       - name: Download package sources
         run: |
           cd openwrt
+          set -o pipefail
           make -j$(nproc) download || make -j$(nproc) download
 
       - name: Build firmware
         run: |
           cd openwrt
-          make -j$(( $(nproc) + 1 )) V=s 2>&1 | tee build.log | tail -n 100
+          set -o pipefail
+          : > build.log
+          make -j$(( $(nproc) + 1 )) V=s 2>&1 | tee -a build.log | tail -n 150
 
       - name: Show artifacts
         if: always()
         run: |
-          ls -lh openwrt/bin/targets/x86/64/ 2>/dev/null || true
-          echo "=== 驱动是否编进镜像 ==="
-          grep -c "dwmac-motorcomm" openwrt/bin/targets/x86/64/*.manifest 2>/dev/null || echo "manifest 未找到"
+          {
+            echo "== bin/targets/x86/64 =="
+            ls -lh openwrt/bin/targets/x86/64/ 2>/dev/null || echo "(目录不存在)"
+            echo "== manifest 里的 motorcomm =="
+            grep -i "motorcomm" openwrt/bin/targets/x86/64/*.manifest 2>/dev/null || echo "(manifest 未找到或无 motorcomm)"
+          } | tee artifact-list.txt
 
       - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: istoreos-25.12-yt6801
+          if-no-files-found: error
           path: |
             openwrt/bin/targets/x86/64/*combined-efi.img.gz
             openwrt/bin/targets/x86/64/*.manifest
             openwrt/bin/targets/x86/64/sha256sums
           retention-days: 14
 
-      - name: Upload build log on failure
-        if: failure()
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-failure
-          path: openwrt/build.log
+          name: build-log
+          if-no-files-found: warn
+          path: |
+            openwrt/build.log
+            artifact-list.txt
           retention-days: 7
+
+      - name: Report failure to issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          LOG=openwrt/build.log
+          [ -s "$LOG" ] || LOG=artifact-list.txt
+          [ -s "$LOG" ] || LOG=/dev/null
+          tail -n 250 "$LOG" > /tmp/tail.txt 2>/dev/null
+          python3 - "$RUN_URL" <<'PY'
+          import json, os, subprocess, sys
+          run_url = sys.argv[1]
+          tail = open('/tmp/tail.txt', encoding='utf-8', errors='replace').read()
+          if len(tail) > 60000:
+              tail = tail[-60000:]
+          body = ("构建失败，以下是日志末尾：\n\n运行记录：" + run_url +
+                  "\n\n```\n" + tail + "\n```\n")
+          payload = json.dumps({"title": "CI failure " + os.environ.get("GITHUB_RUN_ID", ""),
+                                "body": body, "labels": []})
+          open('/tmp/payload.json', 'w', encoding='utf-8').write(payload)
+          subprocess.run(["curl", "-sS", "-X", "POST",
+                          "-H", "Authorization: Bearer " + os.environ["GH_TOKEN"],
+                          "-H", "Accept: application/vnd.github+json",
+                          "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/issues",
+                          "-d", "@/tmp/payload.json"], check=False)
+          PY
