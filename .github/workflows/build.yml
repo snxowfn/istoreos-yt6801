@@ -6,7 +6,7 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -96,11 +96,20 @@ jobs:
       - name: Build firmware
         run: |
           cd openwrt
+          df -h / | tee artifact-df.txt
           set +e
           : > build.log
           make -j$(( $(nproc) + 1 )) V=s 2>&1 | tee -a build.log | tail -n 150
           RC=${PIPESTATUS[0]}
-          echo "make 退出码: $RC"
+          echo "make 退出码: $RC" | tee -a build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "=== 首轮失败，改用 IGNORE_ERRORS=m 续编（跳过个别坏包，仍产出镜像） ===" | tee -a build.log
+            make -j$(( $(nproc) + 1 )) IGNORE_ERRORS=m V=s 2>&1 | tee -a build.log | tail -n 120
+            RC=${PIPESTATUS[0]}
+            echo "IGNORE_ERRORS 重试退出码: $RC" | tee -a build.log
+            echo "=== 被跳过的包 ===" | tee -a build.log
+            grep -E "ERROR: package .* failed|IGNORE_ERRORS|skipped" build.log | tail -40 | tee -a build.log
+          fi
           if [ "$RC" -ne 0 ]; then
             echo "::error::make 失败，退出码 $RC"
             exit "$RC"
@@ -152,15 +161,44 @@ jobs:
             if [ -s "$f" ]; then LOG="$f"; break; fi
           done
           echo "选用日志: ${LOG:-<无>}"
-          if [ -n "$LOG" ]; then tail -n 250 "$LOG" > /tmp/tail.txt; else echo "(没有任何日志文件)" > /tmp/tail.txt; fi
+
+          # 1) 提炼首个失败点 + 所有错误行（并行编译时真错误在几千行之前）
+          : > /tmp/report.txt
+          if [ -n "$LOG" ]; then
+            {
+              echo "### 首个 *** Error 1 之前的上下文"
+              FIRST=$(grep -n '\*\*\* .*Error 1$' "$LOG" | head -1 | cut -d: -f1)
+              if [ -n "$FIRST" ]; then
+                S=$((FIRST-70)); [ "$S" -lt 1 ] && S=1
+                sed -n "${S},$((FIRST+3))p" "$LOG" | cut -c1-260
+              fi
+              echo ""
+              echo "### 所有错误行"
+              grep -nE ': error:|ERROR:|configure: error|No rule to make target|undefined reference|fatal error|Killed|No space left|cannot find -l|download failed|Hash mismatch' "$LOG" | cut -c1-260 | head -80
+            } >> /tmp/report.txt
+          else
+            echo "(没有任何日志文件)" >> /tmp/report.txt
+          fi
+
+          # 2) 把完整日志推到 ci-log 分支，供本地 git fetch 读取（Actions 日志 API 需鉴权）
+          if [ -n "$LOG" ]; then
+            git checkout -q --orphan ci-log-${{ github.run_id }} 2>/dev/null || true
+            git rm -rq --cached . 2>/dev/null || true
+            cp "$LOG" ci-build.log
+            git add -f ci-build.log
+            git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "CI log run ${{ github.run_id }}"
+            git push -f origin HEAD:ci-log 2>&1 | tail -3 || echo "推送 ci-log 分支失败"
+          fi
+
+          # 3) 发 Issue
           python3 - "$RUN_URL" <<'PY'
           import json, os, subprocess, sys
           run_url = sys.argv[1]
-          tail = open('/tmp/tail.txt', encoding='utf-8', errors='replace').read()
-          if len(tail) > 60000:
-              tail = tail[-60000:]
-          body = ("构建失败，以下是日志末尾：\n\n运行记录：" + run_url +
-                  "\n\n```\n" + tail + "\n```\n")
+          rep = open('/tmp/report.txt', encoding='utf-8', errors='replace').read()
+          if len(rep) > 55000:
+              rep = rep[:55000]
+          body = ("构建失败，错误摘要：\n\n运行记录：" + run_url +
+                  "\n\n完整日志见仓库 `ci-log` 分支的 `ci-build.log`。\n\n```\n" + rep + "\n```\n")
           payload = json.dumps({"title": "CI failure " + os.environ.get("GITHUB_RUN_ID", ""),
                                 "body": body, "labels": []})
           open('/tmp/payload.json', 'w', encoding='utf-8').write(payload)
