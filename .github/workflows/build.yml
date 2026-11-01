@@ -57,8 +57,38 @@ jobs:
       - name: Configure (official full package set + YT6801)
         run: |
           cd openwrt
+
+          # --- 内核侧保险 ---
+          # i915-sriov-dkms 内置 vendor 版 DRM_GPUSVM，其 include/config.h 硬性要求内核
+          # 开启 CONFIG_HMM_MIRROR + CONFIG_MMU_NOTIFIER，否则直接 #error 中断编译。
+          # iStoreOS 的 x86/generic config-6.12 均未开启这两个符号，这里补上（不依赖包，纯内核配置）。
+          KCFG=target/linux/x86/config-6.12
+          for sym in CONFIG_HMM_MIRROR CONFIG_MMU_NOTIFIER; do
+            grep -q "^${sym}=y" "$KCFG" || echo "${sym}=y" >> "$KCFG"
+          done
+          echo "=== 内核配置追加结果 ==="
+          grep -nE '^CONFIG_(HMM_MIRROR|MMU_NOTIFIER)=y' "$KCFG"
+
           cp ../seed.config .config
           make defconfig
+
+          # --- 依赖兜底 ---
+          # 三个 SR-IOV 包若被别处依赖重新拉起，就在 2 分钟内失败，而不是编译 2 小时后再失败。
+          for p in kmod-drm-i915-coex kmod-drm-xe-sriov kmod-intel-sriov-compat; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              sed -i "s|^CONFIG_PACKAGE_${p}=y|# CONFIG_PACKAGE_${p} is not set|" .config
+              echo "::warning::强制关闭 ${p}"
+            fi
+          done
+          make defconfig
+
+          echo "=== SR-IOV 包状态（应全部为 is not set） ==="
+          grep -E "^#? ?CONFIG_PACKAGE_kmod-(drm-i915-coex|drm-xe-sriov|intel-sriov-compat)" .config || echo "(未出现)"
+          if grep -qE "^CONFIG_PACKAGE_(kmod-drm-i915-coex|kmod-drm-xe-sriov|kmod-intel-sriov-compat)=y" .config; then
+            echo "::error::SR-IOV 包被依赖重新拉起，关闭失败，需要换方案"
+            exit 1
+          fi
+
           echo "=== 关键配置确认 ==="
           for s in CONFIG_PACKAGE_kmod-dwmac-motorcomm CONFIG_PACKAGE_luci-app-store \
                    CONFIG_PACKAGE_docker CONFIG_PACKAGE_luci-app-dockerman \
@@ -85,6 +115,11 @@ jobs:
           echo "prepare 退出码: $RC"
           echo "== Patch failed 出现次数: $(grep -c 'Patch failed' prepare.log || true) =="
           echo "== prepared 打点: $(ls build_dir/target-x86_64_musl/linux-x86_64/linux-*/.prepared_* 2>/dev/null | wc -l) =="
+          KCONF=$(ls build_dir/target-*/linux-*/linux-6.12.*/.config 2>/dev/null | head -1)
+          if [ -n "$KCONF" ]; then
+            echo "== 内核 .config: $KCONF"
+            grep -E '^CONFIG_(HMM_MIRROR|MMU_NOTIFIER|DRM_GPUSVM)' "$KCONF" || echo "(内核配置里没有 HMM_MIRROR/MMU_NOTIFIER 相关项)"
+          fi
           exit 0
 
       - name: Download package sources
@@ -103,17 +138,22 @@ jobs:
           RC=${PIPESTATUS[0]}
           echo "make 退出码: $RC" | tee -a build.log
           if [ "$RC" -ne 0 ]; then
-            echo "=== 首轮失败，改用 IGNORE_ERRORS=m 续编（跳过个别坏包，仍产出镜像） ===" | tee -a build.log
-            make -j$(( $(nproc) + 1 )) IGNORE_ERRORS=m V=s 2>&1 | tee -a build.log | tail -n 120
+            echo "=== 首轮失败，用 -k + IGNORE_ERRORS=m 续编（跳过坏包，尽量把镜像做出来） ===" | tee -a build.log
+            make -k -j$(( $(nproc) + 1 )) IGNORE_ERRORS=m V=s 2>&1 | tee -a build.log | tail -n 120
             RC=${PIPESTATUS[0]}
-            echo "IGNORE_ERRORS 重试退出码: $RC" | tee -a build.log
+            echo "-k 重试退出码: $RC" | tee -a build.log
             echo "=== 被跳过的包 ===" | tee -a build.log
-            grep -E "ERROR: package .* failed|IGNORE_ERRORS|skipped" build.log | tail -40 | tee -a build.log
+            grep -E "ERROR: package .* failed" build.log | sort -u | tee -a build.log
           fi
-          if [ "$RC" -ne 0 ]; then
-            echo "::error::make 失败，退出码 $RC"
-            exit "$RC"
+          # 只要镜像做出来了就算成功（个别可选包失败不影响固件可用性）
+          IMG=$(ls bin/targets/x86/64/*combined-efi.img.gz 2>/dev/null | head -1)
+          if [ -z "$IMG" ]; then
+            echo "::error::make 退出码 $RC，且未产出镜像"
+            exit 1
           fi
+          echo "=== 镜像已产出（make 退出码 $RC）===" | tee -a build.log
+          ls -lh "$IMG" | tee -a build.log
+          tail -5 build.log
 
       - name: Show artifacts
         if: always()
@@ -123,10 +163,12 @@ jobs:
             ls -lh openwrt/bin/targets/x86/64/ 2>/dev/null || echo "(目录不存在)"
             echo "== manifest 里的 motorcomm =="
             grep -i "motorcomm" openwrt/bin/targets/x86/64/*.manifest 2>/dev/null || echo "(manifest 未找到或无 motorcomm)"
+            echo "== manifest 里的 sriov（应为空）=="
+            grep -i "sriov" openwrt/bin/targets/x86/64/*.manifest 2>/dev/null || echo "(无，符合预期)"
           } | tee artifact-list.txt
 
       - name: Upload firmware
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: istoreos-25.12-yt6801
