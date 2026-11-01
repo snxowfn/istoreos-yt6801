@@ -78,8 +78,12 @@ jobs:
         run: |
           cd openwrt
           set -o pipefail
-          mkdir -p /tmp/prep
-          make -j1 target/linux/prepare V=s 2>&1 | tail -n 120
+          : > prepare.log
+          make -j1 target/linux/prepare V=s 2>&1 | tee -a prepare.log | tail -n 120
+          if grep -qiE "FAILED|Reversed|malformed patch|No rule to make target" prepare.log; then
+            echo "::error::内核补丁应用失败，详见 prepare.log"
+            exit 1
+          fi
           echo "== 内核补丁应用完成，未发现 FAILED =="
 
       - name: Download package sources
@@ -125,6 +129,7 @@ jobs:
           if-no-files-found: warn
           path: |
             openwrt/build.log
+            openwrt/prepare.log
             artifact-list.txt
           retention-days: 7
 
@@ -135,10 +140,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          LOG=openwrt/build.log
-          [ -s "$LOG" ] || LOG=artifact-list.txt
-          [ -s "$LOG" ] || LOG=/dev/null
-          tail -n 250 "$LOG" > /tmp/tail.txt 2>/dev/null
+          LOG=""
+          for f in openwrt/build.log openwrt/prepare.log artifact-list.txt; do
+            if [ -s "$f" ]; then LOG="$f"; break; fi
+          done
+          echo "选用日志: ${LOG:-<无>}"
+          if [ -n "$LOG" ]; then tail -n 250 "$LOG" > /tmp/tail.txt; else echo "(没有任何日志文件)" > /tmp/tail.txt; fi
           python3 - "$RUN_URL" <<'PY'
           import json, os, subprocess, sys
           run_url = sys.argv[1]
