@@ -28,6 +28,7 @@ Signed-off-by: Jakub Kicinski <kuba@kernel.org>
  create mode 100644 drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.c
 
 --- a/drivers/net/ethernet/stmicro/stmmac/Kconfig
++++ b/drivers/net/ethernet/stmicro/stmmac/Kconfig
 @@ -298,6 +298,14 @@ config DWMAC_LOONGSON
  	  This selects the LOONGSON PCI bus support for the stmmac driver,
  	  Support for ethernet controller on Loongson-2K1000 SoC and LS7A1000 bridge.
@@ -44,6 +45,7 @@ Signed-off-by: Jakub Kicinski <kuba@kernel.org>
  	tristate "STMMAC PCI bus support"
  	depends on STMMAC_ETH && PCI
 --- a/drivers/net/ethernet/stmicro/stmmac/Makefile
++++ b/drivers/net/ethernet/stmicro/stmmac/Makefile
 @@ -41,4 +41,5 @@ dwmac-altr-socfpga-objs := dwmac-socfpga
  obj-$(CONFIG_STMMAC_PCI)	+= stmmac-pci.o
  obj-$(CONFIG_DWMAC_INTEL)	+= dwmac-intel.o
@@ -51,6 +53,7 @@ Signed-off-by: Jakub Kicinski <kuba@kernel.org>
 +obj-$(CONFIG_DWMAC_MOTORCOMM)	+= dwmac-motorcomm.o
  stmmac-pci-objs:= stmmac_pci.o
 --- /dev/null
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.c
 @@ -0,0 +1,415 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
