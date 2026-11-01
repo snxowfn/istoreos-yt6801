@@ -24,7 +24,7 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: false
+          large-packages: true
           swap-storage: true
 
       - name: Install build dependencies
@@ -54,24 +54,25 @@ jobs:
           chmod +x scripts/apply-patches.sh
           ./scripts/apply-patches.sh openwrt
 
-      - name: Configure
+      - name: Configure (official full package set + YT6801)
         run: |
           cd openwrt
-          cat > .config <<'EOF'
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_Generic=y
-          CONFIG_TARGET_ROOTFS_SQUASHFS=y
-          CONFIG_TARGET_IMAGES_GZIP=y
-          CONFIG_PACKAGE_kmod-dwmac-motorcomm=y
-          CONFIG_PACKAGE_luci=y
-          EOF
+          cp ../seed.config .config
           make defconfig
           echo "=== 关键配置确认 ==="
-          grep -E "CONFIG_TARGET_x86_64_Generic|CONFIG_PACKAGE_kmod-dwmac-motorcomm|CONFIG_PACKAGE_luci=" .config || true
+          for s in CONFIG_PACKAGE_kmod-dwmac-motorcomm CONFIG_PACKAGE_luci-app-store \
+                   CONFIG_PACKAGE_docker CONFIG_PACKAGE_luci-app-dockerman \
+                   CONFIG_PACKAGE_luci CONFIG_TARGET_ROOTFS_PARTSIZE; do
+            printf '%-45s %s\n' "$s" "$(grep -E "^${s}=" .config || echo '<未选中>')"
+          done
+          echo "=== 选中包总数 ==="
+          grep -c '^CONFIG_PACKAGE_.*=y$' .config
           if ! grep -q "^CONFIG_PACKAGE_kmod-dwmac-motorcomm=y" .config; then
             echo "::error::kmod-dwmac-motorcomm 未被选中，检查补丁是否生效"
             exit 1
+          fi
+          if ! grep -q "^CONFIG_PACKAGE_luci-app-store=y" .config; then
+            echo "::warning::luci-app-store 未选中（应用商店缺失，可继续）"
           fi
 
       - name: Pre-check kernel patches
