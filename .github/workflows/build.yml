@@ -1,0 +1,108 @@
+name: Build iStoreOS 25.12 with YT6801 driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools python3-pip rsync unzip zlib1g-dev file \
+            wget cpio swig time subversion mercurial rsync
+          df -h /
+
+      - name: Clone iStoreOS 25.12
+        run: |
+          git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos.git openwrt
+          cd openwrt
+          git log -1 --oneline
+          grep -r "LINUX_VERSION-6.12" target/linux/generic/kernel-6.12
+
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply YT6801 patches
+        run: |
+          chmod +x scripts/apply-patches.sh
+          ./scripts/apply-patches.sh openwrt
+
+      - name: Configure
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_Generic=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_PACKAGE_kmod-dwmac-motorcomm=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-store=y
+          EOF
+          make defconfig
+          echo "=== 关键配置确认 ==="
+          grep -E "CONFIG_TARGET_x86_64_Generic|CONFIG_PACKAGE_kmod-dwmac-motorcomm|CONFIG_PACKAGE_luci=" .config || true
+          if ! grep -q "^CONFIG_PACKAGE_kmod-dwmac-motorcomm=y" .config; then
+            echo "::error::kmod-dwmac-motorcomm 未被选中，检查补丁是否生效"
+            exit 1
+          fi
+
+      - name: Download package sources
+        run: |
+          cd openwrt
+          make -j$(nproc) download || make -j$(nproc) download
+
+      - name: Build firmware
+        run: |
+          cd openwrt
+          make -j$(( $(nproc) + 1 )) V=s 2>&1 | tee build.log | tail -n 100
+
+      - name: Show artifacts
+        if: always()
+        run: |
+          ls -lh openwrt/bin/targets/x86/64/ 2>/dev/null || true
+          echo "=== 驱动是否编进镜像 ==="
+          grep -c "dwmac-motorcomm" openwrt/bin/targets/x86/64/*.manifest 2>/dev/null || echo "manifest 未找到"
+
+      - name: Upload firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: istoreos-25.12-yt6801
+          path: |
+            openwrt/bin/targets/x86/64/*combined-efi.img.gz
+            openwrt/bin/targets/x86/64/*.manifest
+            openwrt/bin/targets/x86/64/sha256sums
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failure
+          path: openwrt/build.log
+          retention-days: 7
