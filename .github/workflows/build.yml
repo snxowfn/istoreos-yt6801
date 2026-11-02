@@ -56,11 +56,23 @@ jobs:
           src-git diskman https://github.com/lisaac/luci-app-diskman.git;master
           src-git oaf https://github.com/destan19/OpenAppFilter.git;master
           src-git jjm2473_apps https://github.com/jjm2473/openwrt-apps.git;main
+          # --- Lua 版 Docker 管理界面（官方 25.12.6 发布用的就是它，顶级 Docker 菜单）---
+          # luci feed 已把 luci-app-dockerman 重写成 JS/ucode 版（挂在"服务"下且在 iStoreOS 上不显示），
+          # 必须用 lisaac 的 Lua 版强制覆盖，才有官方同款顶级 Docker 菜单（配置/概览/容器/镜像/网络/卷标/事件）。
+          src-git dockerman https://github.com/lisaac/luci-app-dockerman.git;master
+          src-git luci_lib_docker https://github.com/lisaac/luci-lib-docker.git;master
           FEEDS
           echo "=== feeds.conf.default ==="
           cat feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # 强制用 Lua 版覆盖 luci feed 的 JS 版 dockerman，并补上 luci feed 没有的 luci-lib-docker
+          ./scripts/feeds install -f -p dockerman luci-app-dockerman
+          ./scripts/feeds install -f -p luci_lib_docker luci-lib-docker
+          echo "=== dockerman 来源确认（应指向 package/feeds/dockerman）==="
+          ls -ld package/feeds/dockerman/luci-app-dockerman package/feeds/luci_lib_docker/luci-lib-docker 2>&1
+          grep -l "luci.model.docker" package/feeds/dockerman/luci-app-dockerman/luasrc/controller/*.lua 2>/dev/null && \
+            echo "OK: Lua 版 dockerman 已生效" || echo "::error::dockerman 覆盖失败，仍是 JS 版"
 
       - name: Apply YT6801 patches
         run: |
@@ -119,6 +131,7 @@ jobs:
           # 上轮教训：feed 缺失时 make defconfig 会静默丢包，固件能启动但功能残缺。
           MISS=""
           for p in kmod-dwmac-motorcomm docker dockerd luci-app-dockerman \
+                   luci-lib-docker luci-compat luci-i18n-dockerman-zh-cn \
                    luci-app-store luci quickstart luci-app-quickstart \
                    linkease ddnsto luci-app-ddnsto luci-app-diskman \
                    luci-app-oaf mergerfs luci-app-mergerfs nvtop \
@@ -199,8 +212,16 @@ jobs:
             fi
             echo "== rootfs 里的关键程序（抽查）=="
             for f in usr/libexec/docker/cli-tools/docker usr/bin/dockerd \
-                     usr/lib/lua/luci/controller/quickstart.lua usr/lib/lua/luci; do
+                     usr/lib/lua/luci/controller/quickstart.lua; do
               [ -e "$ROOTFS/$f" ] && echo "  OK  $f" || echo "  --  $f（可能路径不同，仅抽查）"
+            done
+            echo "== rootfs 里的 Lua 版 dockerman（顶级 Docker 菜单，必须有）=="
+            for f in usr/lib/lua/luci/controller/dockerman.lua \
+                     usr/lib/lua/luci/model/docker.lua; do
+              if [ -e "$ROOTFS/$f" ]; then echo "  OK  $f"; else
+                echo "::error::rootfs 缺少 $f —— Docker 菜单将不显示，检查 dockerman feed 覆盖是否生效"
+                exit 1
+              fi
             done
           } | tee artifact-list.txt
 
