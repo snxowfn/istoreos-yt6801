@@ -33,7 +33,7 @@ jobs:
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools python3-pip rsync unzip zlib1g-dev file \
-            wget cpio swig time subversion mercurial rsync
+            wget cpio swig time subversion mercurial rsync help2man
           df -h /
 
       - name: Clone iStoreOS 25.12
@@ -226,7 +226,7 @@ jobs:
             KO=$(find "$ROOTFS/lib/modules" -name 'dwmac-motorcomm.ko' 2>/dev/null | wc -l)
             if [ "$KO" -eq 0 ]; then
               echo "::error::rootfs 中没有 dwmac-motorcomm.ko，驱动未进镜像！"
-              exit 1
+              echo "FAIL=driver" >> "$GITHUB_ENV"
             fi
             echo "== rootfs 里的关键程序（抽查）=="
             for f in usr/libexec/docker/cli-tools/docker usr/bin/dockerd \
@@ -237,11 +237,14 @@ jobs:
             for f in usr/lib/lua/luci/controller/dockerman.lua \
                      usr/lib/lua/luci/model/docker.lua; do
               if [ -e "$ROOTFS/$f" ]; then echo "  OK  $f"; else
-                echo "::error::rootfs 缺少 $f —— Docker 菜单将不显示，检查 dockerman feed 覆盖是否生效"
-                exit 1
+                echo "::error::rootfs 缺少 $f —— Docker 菜单将不显示，检查 dockerman 覆盖是否生效"
+                echo "FAIL=dockerman" >> "$GITHUB_ENV"
               fi
             done
-          } | tee artifact-list.txt
+          } > artifact-list.txt 2>&1
+          cat artifact-list.txt
+          # 修复上一版 bug：管道 tee 会吞掉块的退出码，导致自检报错但步骤仍显示成功
+          grep -q '^FAIL=' artifact-list.txt && exit 1 || true
 
       - name: Upload firmware
         if: always()
@@ -281,31 +284,36 @@ jobs:
           done
           echo "选用日志: ${LOG:-<无>}"
 
-          # 1) 提炼首个失败点 + 所有错误行（并行编译时真错误在几千行之前）
+          # 1) 提炼失败原因。教训：上轮 grep head -80 把致命错误挤出列表，
+          #    全是 "for mod in" 之类的噪声行，真正挂掉的包根本没进 Issue。
           : > /tmp/report.txt
           if [ -n "$LOG" ]; then
             {
-              echo "### 首个 *** Error 1 之前的上下文"
-              FIRST=$(grep -n '\*\*\* .*Error 1$' "$LOG" | head -1 | cut -d: -f1)
-              if [ -n "$FIRST" ]; then
-                S=$((FIRST-70)); [ "$S" -lt 1 ] && S=1
-                sed -n "${S},$((FIRST+3))p" "$LOG" | cut -c1-260
-              fi
+              echo "### ① 致命错误行（ERROR: package ... failed to build / failed to install）"
+              grep -nE 'ERROR: (package|tools)|failed to (build|install|compile)|Collected errors|opkg_conf' "$LOG" | cut -c1-300 | head -50
               echo ""
-              echo "### 所有错误行"
-              grep -nE ': error:|ERROR:|configure: error|No rule to make target|undefined reference|fatal error|Killed|No space left|cannot find -l|download failed|Hash mismatch' "$LOG" | cut -c1-260 | head -80
+              echo "### ② 所有 make *** Error 行（真实错误一般是最后几条）"
+              grep -nE '\*\*\* (Error|[^ ].*Error [0-9])' "$LOG" | cut -c1-300 | tail -40
+              echo ""
+              echo "### ③ 内存/磁盘杀手检查"
+              grep -nE 'Killed|out of memory|No space left|signal 9' "$LOG" | cut -c1-300 | head -10
+              echo ""
+              echo "### ④ 日志末尾 100 行"
+              tail -n 100 "$LOG" | cut -c1-300
             } >> /tmp/report.txt
           else
             echo "(没有任何日志文件)" >> /tmp/report.txt
           fi
 
-          # 2) 把完整日志推到 ci-log 分支，供本地 git fetch 读取（Actions 日志 API 需鉴权）
+          # 2) 把完整日志 gzip 后推到 ci-log 分支（V=s 全量日志有几十万行，
+          #    裸文件会超 GitHub 100MB 推送上限导致上轮推送失败；gzip 后只有几 MB）
           if [ -n "$LOG" ]; then
-            git checkout -q --orphan ci-log-${{ github.run_id }} 2>/dev/null || true
+            gzip -kf "$LOG"
+            git checkout -q --orphan ci-log-push 2>/dev/null || true
             git rm -rq --cached . 2>/dev/null || true
-            cp "$LOG" ci-build.log
-            git add -f ci-build.log
-            git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "CI log run ${{ github.run_id }}"
+            mv "${LOG}.gz" ci-build.log.gz
+            git add -f ci-build.log.gz
+            git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "CI log (gzip) run ${{ github.run_id }}"
             git push -f origin HEAD:ci-log 2>&1 | tail -3 || echo "推送 ci-log 分支失败"
           fi
 
@@ -314,10 +322,10 @@ jobs:
           import json, os, subprocess, sys
           run_url = sys.argv[1]
           rep = open('/tmp/report.txt', encoding='utf-8', errors='replace').read()
-          if len(rep) > 55000:
-              rep = rep[:55000]
+          if len(rep) > 58000:
+              rep = rep[:58000] + "\n...(报告超长被截断，完整日志见 ci-log 分支 ci-build.log.gz)\n"
           body = ("构建失败，错误摘要：\n\n运行记录：" + run_url +
-                  "\n\n完整日志见仓库 `ci-log` 分支的 `ci-build.log`。\n\n```\n" + rep + "\n```\n")
+                  "\n\n完整日志（gzip）见仓库 `ci-log` 分支的 `ci-build.log.gz`。\n\n```\n" + rep + "\n```\n")
           payload = json.dumps({"title": "CI failure " + os.environ.get("GITHUB_RUN_ID", ""),
                                 "body": body, "labels": []})
           open('/tmp/payload.json', 'w', encoding='utf-8').write(payload)
