@@ -78,6 +78,22 @@ jobs:
           cp -r /tmp/src-dockerman/applications/luci-app-dockerman package/dockerman-lua/
           cp -r /tmp/src-luci-lib-docker/collections/luci-lib-docker package/dockerman-lua/
           rm -rf package/dockerman-lua/luci-app-dockerman/.github
+          # --- 版本号修正 ---
+          # lisaac 源码 Makefile 硬编码 PKG_VERSION:=v0.3.4（带字母 v 前缀），
+          # 新版 apk mkpkg 校验版本号必须以数字开头，直接报
+          # "ERROR: info field 'version' has invalid value: package version is invalid"（Error 99）。
+          # luci-app-dockerman 依赖 luci-lib-docker，lib 挂了它连编译机会都没有，一并处理。
+          for MK in package/dockerman-lua/luci-lib-docker/Makefile \
+                    package/dockerman-lua/luci-app-dockerman/Makefile; do
+            if grep -qE '^PKG_VERSION:=v' "$MK"; then
+              sed -i 's/^PKG_VERSION:=v/PKG_VERSION:=/' "$MK"
+              echo "已修正版本号: $MK -> $(grep '^PKG_VERSION' "$MK")"
+            elif grep -q '^PKG_VERSION:=' "$MK"; then
+              echo "版本号正常: $MK $(grep '^PKG_VERSION' "$MK")"
+            else
+              echo "Makefile 无 PKG_VERSION（版本可能由 git describe 生成）: $MK"
+            fi
+          done
           echo "=== 内置的 Lua 版 dockerman ==="
           ls -l package/dockerman-lua/
           grep -q 'luci.model.docker' package/dockerman-lua/luci-app-dockerman/luasrc/controller/dockerman.lua \
