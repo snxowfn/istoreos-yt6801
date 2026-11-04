@@ -1,0 +1,4 @@
+*.patch -text
+*.sh text eol=lf
+seed*.config text eol=lf
+*.yml text eol=lf

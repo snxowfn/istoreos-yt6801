@@ -1,0 +1,353 @@
+name: Build iStoreOS 25.12 with YT6801 driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools python3-pip rsync unzip zlib1g-dev file \
+            wget cpio swig time subversion mercurial rsync help2man
+          df -h /
+
+      - name: Clone iStoreOS 25.12
+        run: |
+          git clone --depth 1 -b istoreos-25.12 https://github.com/istoreos/istoreos.git openwrt
+          cd openwrt
+          git log -1 --oneline
+          cat target/linux/generic/kernel-6.12
+
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          # 把本步骤全部输出同时写入 feeds.log，失败时随 build-log artifact 上传（Actions 原始日志需鉴权，本地取不到）
+          exec > >(tee -a feeds.log) 2>&1
+          set -o pipefail
+          # 官方 25.12.6 发布流水线额外使用的 5 个 feed，公开分支的 feeds.conf.default 未声明。
+          # 缺了它们，quickstart/linkease/ddnsto/diskman/oaf/mergerfs/nvtop 等约 30 个包
+          # 会在 make defconfig 时被静默丢弃（症状：固件能启动，但首页菜单不全、NAS/Docker 体验残缺）。
+          cat >> feeds.conf.default <<'FEEDS'
+          # --- 官方全量包所需的额外 feed ---
+          src-git linkease_nas https://github.com/linkease/nas-packages.git;master
+          src-git linkease_nas_luci https://github.com/linkease/nas-packages-luci.git;main
+          src-git diskman https://github.com/lisaac/luci-app-diskman.git;master
+          src-git oaf https://github.com/destan19/OpenAppFilter.git;master
+          src-git jjm2473_apps https://github.com/jjm2473/openwrt-apps.git;main
+          FEEDS
+          echo "=== feeds.conf.default ==="
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # --- 用 Lua 版 luci-app-dockerman 替换 luci feed 的 JS 版 ---
+          # 官方 25.12.6 用的是 lisaac 的 Lua 版（菜单挂顶级 admin/docker，"配置"项无条件注册，
+          # 所以侧边栏必有 Docker 菜单）。当前 luci feed 已重写为 JS/ucode 版（挂 admin/services
+          # 下且依赖 dockerd 运行态），iStoreOS 上不显示，导致刷机后完全看不到 Docker 入口。
+          # 同名包不能由两个 feed 同时提供（feeds install 会失败），所以直接内置到 package/ 下：
+          # 先删掉 luci feed 装进来的 JS 版，再放入 Lua 版源码（含 po/zh_Hans，自动产出中文包）。
+          rm -rf package/feeds/luci/luci-app-dockerman
+          git clone --depth 1 https://github.com/lisaac/luci-app-dockerman.git /tmp/src-dockerman
+          git clone --depth 1 https://github.com/lisaac/luci-lib-docker.git /tmp/src-luci-lib-docker
+          mkdir -p package/dockerman-lua
+          cp -r /tmp/src-dockerman/applications/luci-app-dockerman package/dockerman-lua/
+          cp -r /tmp/src-luci-lib-docker/collections/luci-lib-docker package/dockerman-lua/
+          rm -rf package/dockerman-lua/luci-app-dockerman/.github
+          # --- 版本号修正 ---
+          # lisaac 源码 Makefile 硬编码 PKG_VERSION:=v0.3.4（带字母 v 前缀），
+          # 新版 apk mkpkg 校验版本号必须以数字开头，直接报
+          # "ERROR: info field 'version' has invalid value: package version is invalid"（Error 99）。
+          # luci-app-dockerman 依赖 luci-lib-docker，lib 挂了它连编译机会都没有，一并处理。
+          for MK in package/dockerman-lua/luci-lib-docker/Makefile \
+                    package/dockerman-lua/luci-app-dockerman/Makefile; do
+            if grep -qE '^PKG_VERSION:=v' "$MK"; then
+              sed -i 's/^PKG_VERSION:=v/PKG_VERSION:=/' "$MK"
+              echo "已修正版本号: $MK -> $(grep '^PKG_VERSION' "$MK")"
+            elif grep -q '^PKG_VERSION:=' "$MK"; then
+              echo "版本号正常: $MK $(grep '^PKG_VERSION' "$MK")"
+            else
+              echo "Makefile 无 PKG_VERSION（版本可能由 git describe 生成）: $MK"
+            fi
+          done
+          echo "=== 内置的 Lua 版 dockerman ==="
+          ls -l package/dockerman-lua/
+          grep -q 'luci.model.docker' package/dockerman-lua/luci-app-dockerman/luasrc/controller/dockerman.lua \
+            && echo "OK: Lua 版 dockerman 就位（顶级 Docker 菜单）" \
+            || { echo "::error::dockerman 源码不正确，未找到 Lua 控制器"; exit 1; }
+          echo "=== 确认 luci feed 的 JS 版已移除 ==="
+          if [ -e package/feeds/luci/luci-app-dockerman ]; then
+            echo "::error::JS 版 dockerman 仍然存在，会与内置包冲突"
+            exit 1
+          fi
+
+      - name: Apply YT6801 patches
+        run: |
+          chmod +x scripts/apply-patches.sh
+          ./scripts/apply-patches.sh openwrt
+
+      - name: Configure (official full package set + YT6801)
+        run: |
+          cd openwrt
+
+          # --- 内核侧保险 ---
+          # i915-sriov-dkms 内置 vendor 版 DRM_GPUSVM，其 include/config.h 硬性要求内核
+          # 开启 CONFIG_HMM_MIRROR + CONFIG_MMU_NOTIFIER，否则直接 #error 中断编译。
+          # iStoreOS 的 x86/generic config-6.12 均未开启这两个符号，这里补上（不依赖包，纯内核配置）。
+          KCFG=target/linux/x86/config-6.12
+          for sym in CONFIG_HMM_MIRROR CONFIG_MMU_NOTIFIER; do
+            grep -q "^${sym}=y" "$KCFG" || echo "${sym}=y" >> "$KCFG"
+          done
+          echo "=== 内核配置追加结果 ==="
+          grep -nE '^CONFIG_(HMM_MIRROR|MMU_NOTIFIER)=y' "$KCFG"
+
+          cp ../seed.config .config
+          make defconfig
+
+          # --- 依赖兜底 ---
+          # 三个 SR-IOV 包若被别处依赖重新拉起，就在 2 分钟内失败，而不是编译 2 小时后再失败。
+          for p in kmod-drm-i915-coex kmod-drm-xe-sriov kmod-intel-sriov-compat; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              sed -i "s|^CONFIG_PACKAGE_${p}=y|# CONFIG_PACKAGE_${p} is not set|" .config
+              echo "::warning::强制关闭 ${p}"
+            fi
+          done
+          make defconfig
+
+          echo "=== SR-IOV 包状态（应全部为 is not set） ==="
+          grep -E "^#? ?CONFIG_PACKAGE_kmod-(drm-i915-coex|drm-xe-sriov|intel-sriov-compat)" .config || echo "(未出现)"
+          if grep -qE "^CONFIG_PACKAGE_(kmod-drm-i915-coex|kmod-drm-xe-sriov|kmod-intel-sriov-compat)=y" .config; then
+            echo "::error::SR-IOV 包被依赖重新拉起，关闭失败，需要换方案"
+            exit 1
+          fi
+
+          echo "=== 关键配置确认 ==="
+          for s in CONFIG_PACKAGE_kmod-dwmac-motorcomm CONFIG_PACKAGE_luci-app-store \
+                   CONFIG_PACKAGE_docker CONFIG_PACKAGE_luci-app-dockerman \
+                   CONFIG_PACKAGE_quickstart CONFIG_TARGET_ROOTFS_PARTSIZE; do
+            printf '%-45s %s\n' "$s" "$(grep -E "^${s}=" .config || echo '<未选中>')"
+          done
+          echo "=== 选中包总数 ==="
+          grep -c '^CONFIG_PACKAGE_.*=y$' .config
+          if ! grep -q "^CONFIG_PACKAGE_kmod-dwmac-motorcomm=y" .config; then
+            echo "::error::kmod-dwmac-motorcomm 未被选中，检查补丁是否生效"
+            exit 1
+          fi
+
+          # --- 关键包防呆：任何一项缺失都立即失败，绝不带伤编译 3 小时 ---
+          # 上轮教训：feed 缺失时 make defconfig 会静默丢包，固件能启动但功能残缺。
+          MISS=""
+          for p in kmod-dwmac-motorcomm docker dockerd luci-app-dockerman \
+                   luci-lib-docker luci-compat \
+                   luci-app-store luci quickstart luci-app-quickstart \
+                   linkease ddnsto luci-app-ddnsto luci-app-diskman \
+                   luci-app-oaf mergerfs luci-app-mergerfs nvtop \
+                   luci-app-fan luci-app-cpufreq luci-app-unishare webdav2; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || MISS="$MISS $p"
+          done
+          if [ -n "$MISS" ]; then
+            echo "::error::关键包在 make defconfig 后丢失:${MISS}（多半是对应 feed 没装上）"
+            exit 1
+          fi
+          # 中文翻译包只做提示（名称随 luci.mk 版本可能变化，不影响功能）
+          grep -q "^CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y" .config || \
+            echo "::warning::luci-i18n-dockerman-zh-cn 未选中，Docker 界面可能是英文"
+
+      - name: Pre-check kernel patches
+        continue-on-error: true
+        run: |
+          cd openwrt
+          : > prepare.log
+          make -j1 target/linux/prepare V=s 2>&1 | tee -a prepare.log | tail -n 120
+          RC=${PIPESTATUS[0]}
+          echo "prepare 退出码: $RC"
+          echo "== Patch failed 出现次数: $(grep -c 'Patch failed' prepare.log || true) =="
+          echo "== prepared 打点: $(ls build_dir/target-x86_64_musl/linux-x86_64/linux-*/.prepared_* 2>/dev/null | wc -l) =="
+          KCONF=$(ls build_dir/target-*/linux-*/linux-6.12.*/.config 2>/dev/null | head -1)
+          if [ -n "$KCONF" ]; then
+            echo "== 内核 .config: $KCONF"
+            grep -E '^CONFIG_(HMM_MIRROR|MMU_NOTIFIER|DRM_GPUSVM)' "$KCONF" || echo "(内核配置里没有 HMM_MIRROR/MMU_NOTIFIER 相关项)"
+          fi
+          exit 0
+
+      - name: Download package sources
+        run: |
+          cd openwrt
+          set -o pipefail
+          make -j$(nproc) download || make -j$(nproc) download
+
+      - name: Build firmware
+        run: |
+          cd openwrt
+          df -h / | tee artifact-df.txt
+          set +e
+          : > build.log
+          make -j$(( $(nproc) + 1 )) V=s 2>&1 | tee -a build.log | tail -n 150
+          RC=${PIPESTATUS[0]}
+          echo "make 退出码: $RC" | tee -a build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "=== 首轮失败，用 -k + IGNORE_ERRORS=m 续编（跳过坏包，尽量把镜像做出来） ===" | tee -a build.log
+            make -k -j$(( $(nproc) + 1 )) IGNORE_ERRORS=m V=s 2>&1 | tee -a build.log | tail -n 120
+            RC=${PIPESTATUS[0]}
+            echo "-k 重试退出码: $RC" | tee -a build.log
+            echo "=== 被跳过的包 ===" | tee -a build.log
+            grep -E "ERROR: package .* failed" build.log | sort -u | tee -a build.log
+          fi
+          # 只要镜像做出来了就算成功（个别可选包失败不影响固件可用性）
+          IMG=$(ls bin/targets/x86/64/*combined-efi.img.gz 2>/dev/null | head -1)
+          if [ -z "$IMG" ]; then
+            echo "::error::make 退出码 $RC，且未产出镜像"
+            exit 1
+          fi
+          echo "=== 镜像已产出（make 退出码 $RC）===" | tee -a build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::make 退出码 $RC，镜像为 -k 容错模式产出（可能有包被跳过），必须核对 build.log 再交付"
+          fi
+          ls -lh "$IMG" | tee -a build.log
+          tail -5 build.log
+
+      - name: Show artifacts
+        if: always()
+        run: |
+          {
+            echo "== bin/targets/x86/64 =="
+            ls -lh openwrt/bin/targets/x86/64/ 2>/dev/null || echo "(目录不存在)"
+            echo "== rootfs 里的 motorcomm 驱动（必须有）=="
+            ROOTFS=openwrt/build_dir/target-x86_64_musl/root-x86
+            find "$ROOTFS/lib/modules" -name 'dwmac-motorcomm.ko' -o -name 'motorcomm.ko' 2>/dev/null || true
+            KO=$(find "$ROOTFS/lib/modules" -name 'dwmac-motorcomm.ko' 2>/dev/null | wc -l)
+            if [ "$KO" -eq 0 ]; then
+              echo "::error::rootfs 中没有 dwmac-motorcomm.ko，驱动未进镜像！"
+              echo "FAIL=driver" >> "$GITHUB_ENV"
+            fi
+            echo "== rootfs 里的关键程序（抽查）=="
+            for f in usr/libexec/docker/cli-tools/docker usr/bin/dockerd \
+                     usr/lib/lua/luci/controller/quickstart.lua; do
+              [ -e "$ROOTFS/$f" ] && echo "  OK  $f" || echo "  --  $f（可能路径不同，仅抽查）"
+            done
+            echo "== rootfs 里的 Lua 版 dockerman（顶级 Docker 菜单，必须有）=="
+            for f in usr/lib/lua/luci/controller/dockerman.lua \
+                     usr/lib/lua/luci/model/docker.lua; do
+              if [ -e "$ROOTFS/$f" ]; then echo "  OK  $f"; else
+                echo "::error::rootfs 缺少 $f —— Docker 菜单将不显示，检查 dockerman 覆盖是否生效"
+                echo "FAIL=dockerman" >> "$GITHUB_ENV"
+              fi
+            done
+          } > artifact-list.txt 2>&1
+          cat artifact-list.txt
+          # 修复上一版 bug：管道 tee 会吞掉块的退出码，导致自检报错但步骤仍显示成功
+          grep -q '^FAIL=' artifact-list.txt && exit 1 || true
+
+      - name: Upload firmware
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: istoreos-25.12-yt6801
+          if-no-files-found: error
+          path: |
+            openwrt/bin/targets/x86/64/*combined-efi.img.gz
+            openwrt/bin/targets/x86/64/*.manifest
+            openwrt/bin/targets/x86/64/sha256sums
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          if-no-files-found: warn
+          path: |
+            openwrt/build.log
+            openwrt/prepare.log
+            openwrt/feeds.log
+            artifact-list.txt
+          retention-days: 7
+
+      - name: Report failure to issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          LOG=""
+          for f in openwrt/build.log openwrt/prepare.log artifact-list.txt; do
+            if [ -s "$f" ]; then LOG="$f"; break; fi
+          done
+          echo "选用日志: ${LOG:-<无>}"
+
+          # 1) 提炼失败原因。教训：上轮 grep head -80 把致命错误挤出列表，
+          #    全是 "for mod in" 之类的噪声行，真正挂掉的包根本没进 Issue。
+          : > /tmp/report.txt
+          if [ -n "$LOG" ]; then
+            {
+              echo "### ① 致命错误行（ERROR: package ... failed to build / failed to install）"
+              grep -nE 'ERROR: (package|tools)|failed to (build|install|compile)|Collected errors|opkg_conf' "$LOG" | cut -c1-300 | head -50
+              echo ""
+              echo "### ② 所有 make *** Error 行（真实错误一般是最后几条）"
+              grep -nE '\*\*\* (Error|[^ ].*Error [0-9])' "$LOG" | cut -c1-300 | tail -40
+              echo ""
+              echo "### ③ 内存/磁盘杀手检查"
+              grep -nE 'Killed|out of memory|No space left|signal 9' "$LOG" | cut -c1-300 | head -10
+              echo ""
+              echo "### ④ 日志末尾 100 行"
+              tail -n 100 "$LOG" | cut -c1-300
+            } >> /tmp/report.txt
+          else
+            echo "(没有任何日志文件)" >> /tmp/report.txt
+          fi
+
+          # 2) 把完整日志 gzip 后推到 ci-log 分支（V=s 全量日志有几十万行，
+          #    裸文件会超 GitHub 100MB 推送上限导致上轮推送失败；gzip 后只有几 MB）
+          if [ -n "$LOG" ]; then
+            gzip -kf "$LOG"
+            git checkout -q --orphan ci-log-push 2>/dev/null || true
+            git rm -rq --cached . 2>/dev/null || true
+            mv "${LOG}.gz" ci-build.log.gz
+            git add -f ci-build.log.gz
+            git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "CI log (gzip) run ${{ github.run_id }}"
+            git push -f origin HEAD:ci-log 2>&1 | tail -3 || echo "推送 ci-log 分支失败"
+          fi
+
+          # 3) 发 Issue
+          python3 - "$RUN_URL" <<'PY'
+          import json, os, subprocess, sys
+          run_url = sys.argv[1]
+          rep = open('/tmp/report.txt', encoding='utf-8', errors='replace').read()
+          if len(rep) > 58000:
+              rep = rep[:58000] + "\n...(报告超长被截断，完整日志见 ci-log 分支 ci-build.log.gz)\n"
+          body = ("构建失败，错误摘要：\n\n运行记录：" + run_url +
+                  "\n\n完整日志（gzip）见仓库 `ci-log` 分支的 `ci-build.log.gz`。\n\n```\n" + rep + "\n```\n")
+          payload = json.dumps({"title": "CI failure " + os.environ.get("GITHUB_RUN_ID", ""),
+                                "body": body, "labels": []})
+          open('/tmp/payload.json', 'w', encoding='utf-8').write(payload)
+          subprocess.run(["curl", "-sS", "-X", "POST",
+                          "-H", "Authorization: Bearer " + os.environ["GH_TOKEN"],
+                          "-H", "Accept: application/vnd.github+json",
+                          "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/issues",
+                          "-d", "@/tmp/payload.json"], check=False)
+          PY

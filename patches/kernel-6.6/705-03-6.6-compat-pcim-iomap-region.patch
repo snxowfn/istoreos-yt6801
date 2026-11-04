@@ -1,0 +1,38 @@
+From: yt6801-builder <builder@localhost>
+Subject: [PATCH] net: stmmac: port dwmac-motorcomm glue to kernel 6.6 PCI iomap API
+
+pcim_iomap_region() only exists from v6.9 onwards. Kernel 6.6.144 (the
+kernel used by iStoreOS 24.10) still uses the two-step API
+pcim_iomap_regions() + pcim_iomap_table(), exactly like the in-tree
+stmmac_pci.c and dwmac-intel.c glues.
+
+Rewrite the BAR mapping in motorcomm_probe() accordingly so the YT6801
+glue driver builds on 6.6.
+
+---
+
+
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-motorcomm.c
+@@ -299,10 +299,17 @@
+ 		return dev_err_probe(&pdev->dev, ret,
+ 				     "failed to enable device\n");
+ 
+-	priv->base = pcim_iomap_region(pdev, 0, DRIVER_NAME);
+-	if (IS_ERR(priv->base))
+-		return dev_err_probe(&pdev->dev, PTR_ERR(priv->base),
+-				     "failed to map IO region\n");
++	/*
++	 * Kernel 6.6 lacks pcim_iomap_region(); use the older two-step API
++	 * that the in-tree stmmac PCI glues (stmmac_pci.c / dwmac-intel.c)
++	 * still rely on for this kernel generation.
++	 */
++	ret = pcim_iomap_regions(pdev, BIT(0), DRIVER_NAME);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret,
++				     "failed to request/map IO region\n");
++
++	priv->base = pcim_iomap_table(pdev)[0];
+ 
+ 	pci_set_master(pdev);
+ 
