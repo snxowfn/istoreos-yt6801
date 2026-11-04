@@ -41,14 +41,30 @@ jobs:
 
       - name: Clone iStoreOS 24.10
         run: |
-          git clone --depth 1 -b istoreos-24.10 https://github.com/istoreos/istoreos.git openwrt
+          # 本步骤的输出也落盘，失败时随 build-log artifact 上传（Actions 原始日志需鉴权）
+          exec > >(tee clone.log) 2>&1
+          set -euo pipefail
+          for i in 1 2 3; do
+            if git clone --depth 1 -b istoreos-24.10 https://github.com/istoreos/istoreos.git openwrt; then
+              break
+            fi
+            echo "clone 第 ${i} 次失败，重试"
+            rm -rf openwrt
+            sleep 10
+          done
           cd openwrt
           git log -1 --oneline
           echo "=== 内核版本（应为 6.6.x）==="
           cat include/kernel-6.6
-          echo "=== 包管理体系确认（应为 opkg/ipk）==="
-          test -d package/system/opkg && echo "OK: opkg 体系" || { echo "::error::不是 opkg 体系，分支选错"; exit 1; }
-          test -d package/system/apk && { echo "::error::出现 apk 目录，说明克隆到了 25.12 分支"; exit 1; } || true
+          echo "=== 包管理体系确认 ==="
+          # 注意：iStoreOS 24.10 分支里 package/system 同时保留了 apk 与 opkg 两个目录，
+          # 不能凭 apk 目录存在就判定分支选错（首版就是被这条守卫误杀的）。
+          # 真正的判据：opkg 目录必须在，且最终产物是 .ipk（构建后由 Show artifacts 复核）。
+          test -d package/system/opkg && echo "OK: opkg 目录存在" || { echo "::error::缺少 package/system/opkg"; exit 1; }
+          if [ -d package/system/apk ]; then
+            echo "提示: 分支同时带有 apk 目录（iStoreOS 24.10 的遗留骨架），以 opkg 为准"
+          fi
+          grep -q '^PKG_MGR' package/Makefile 2>/dev/null || true
 
       - name: Update and install feeds
         run: |
@@ -262,6 +278,7 @@ jobs:
             openwrt/build.log
             openwrt/prepare.log
             openwrt/feeds.log
+            clone.log
             artifact-list.txt
           retention-days: 7
 
@@ -273,7 +290,7 @@ jobs:
         run: |
           set +e
           LOG=""
-          for f in openwrt/build.log openwrt/prepare.log artifact-list.txt; do
+          for f in openwrt/build.log openwrt/prepare.log openwrt/feeds.log clone.log artifact-list.txt; do
             if [ -s "$f" ]; then LOG="$f"; break; fi
           done
           echo "选用日志: ${LOG:-<无>}"
