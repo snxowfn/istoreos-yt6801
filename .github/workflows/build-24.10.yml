@@ -130,6 +130,24 @@ jobs:
           cp ../seed-2410.config .config
           make defconfig
 
+          # --- dnsmasq-full 与 dnsmasq 互斥归一 ---
+          # 症状：defconfig 会把 target 默认的 dnsmasq 打开，rootfs 里先装 dnsmasq，
+          # 再装 dnsmasq-full 时 9 个文件全部 check_data_file_clashes，
+          # opkg_install_cmd: Cannot install package dnsmasq-full → package/install Error 255，
+          # 编译 3.5 小时后在收尾阶段挂掉、不出镜像（run 41815735636 即此原因）。
+          # iStoreOS 官方镜像里只有 dnsmasq-full，没有 dnsmasq。
+          if grep -q '^CONFIG_PACKAGE_dnsmasq-full=y' .config; then
+            sed -i -e 's/^CONFIG_PACKAGE_dnsmasq=y$/# CONFIG_PACKAGE_dnsmasq is not set/' .config
+            grep -q '^# CONFIG_PACKAGE_dnsmasq is not set' .config || \
+              echo '# CONFIG_PACKAGE_dnsmasq is not set' >> .config
+            make defconfig
+            if grep -q '^CONFIG_PACKAGE_dnsmasq=y' .config; then
+              echo "::error::dnsmasq 被其他包硬依赖强行选回，会与 dnsmasq-full 文件冲突"
+              exit 1
+            fi
+            echo "OK: 已关闭 dnsmasq，仅保留 dnsmasq-full（避免 opkg 文件冲突）"
+          fi
+
           echo "=== 关键配置确认 ==="
           for s in CONFIG_PACKAGE_kmod-dwmac-motorcomm CONFIG_PACKAGE_kmod-phy-motorcomm \
                    CONFIG_PACKAGE_luci-app-store CONFIG_PACKAGE_docker \
@@ -185,6 +203,12 @@ jobs:
       - name: Build firmware
         run: |
           cd openwrt
+          # 编译前最后一道防呆：dnsmasq 与 dnsmasq-full 同时选中 → opkg 文件冲突，
+          # 会在 package/install 阶段（耗时 3.5h 后）才失败，必须在这里拦住
+          if grep -q '^CONFIG_PACKAGE_dnsmasq=y' .config && grep -q '^CONFIG_PACKAGE_dnsmasq-full=y' .config; then
+            echo "::error::dnsmasq 与 dnsmasq-full 同时选中，opkg 安装必然冲突"
+            exit 1
+          fi
           df -h / | tee artifact-df.txt
           set +e
           : > build.log
@@ -289,36 +313,43 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          LOG=""
-          for f in openwrt/build.log openwrt/prepare.log openwrt/feeds.log clone.log artifact-list.txt; do
-            if [ -s "$f" ]; then LOG="$f"; break; fi
+          # 教训：以前只挑第一个非空日志，早期失败会选中 clone.log，
+          # 结果 issue 里 ①②④ 全是空的（run 41815121298 就是如此）。改为逐份日志都出摘要。
+          LOGS=""
+          for f in openwrt/build.log openwrt/prepare.log openwrt/feeds.log clone.log; do
+            [ -s "$f" ] && LOGS="$LOGS $f"
           done
-          echo "选用日志: ${LOG:-<无>}"
+          echo "可用日志:${LOGS:-<无>}"
+          BIG=$(ls -S openwrt/build.log openwrt/prepare.log openwrt/feeds.log clone.log 2>/dev/null | head -1)
 
           : > /tmp/report.txt
-          if [ -n "$LOG" ]; then
-            {
-              echo "### ① 致命错误行（ERROR: package ... failed to build / failed to install）"
-              grep -nE 'ERROR: (package|tools)|failed to (build|install|compile)|Collected errors|opkg_conf|Patch failed' "$LOG" | cut -c1-300 | head -50
-              echo ""
-              echo "### ② 所有 make *** Error 行（真实错误一般是最后几条）"
-              grep -nE '\*\*\* (Error|[^ ].*Error [0-9])' "$LOG" | cut -c1-300 | tail -40
-              echo ""
-              echo "### ③ 内存/磁盘杀手检查"
-              grep -nE 'Killed|out of memory|No space left|signal 9' "$LOG" | cut -c1-300 | head -10
-              echo ""
-              echo "### ④ 日志末尾 100 行"
-              tail -n 100 "$LOG" | cut -c1-300
-            } >> /tmp/report.txt
+          if [ -n "$LOGS" ]; then
+            for f in $LOGS; do
+              {
+                echo "#### 日志文件: $f（$(wc -l < "$f") 行）"
+                echo "### ① 致命错误行"
+                grep -nE 'ERROR: (package|tools)|failed to (build|install|compile)|Collected errors|check_data_file_clashes|opkg_install_cmd|Cannot install package|Patch failed' "$f" | cut -c1-300 | head -40
+                echo ""
+                echo "### ② make *** Error 行"
+                grep -nE '\*\*\* .*Error [0-9]' "$f" | cut -c1-300 | tail -20
+                echo ""
+                echo "### ③ 内存/磁盘杀手检查"
+                grep -nE 'Killed|out of memory|No space left|signal 9' "$f" | cut -c1-300 | head -5
+                echo ""
+                echo "### ④ 日志末尾 60 行"
+                tail -n 60 "$f" | cut -c1-300
+                echo ""
+              } >> /tmp/report.txt
+            done
           else
             echo "(没有任何日志文件)" >> /tmp/report.txt
           fi
 
-          if [ -n "$LOG" ]; then
-            gzip -kf "$LOG"
+          if [ -n "$BIG" ]; then
+            gzip -kf "$BIG"
             git checkout -q --orphan ci-log-push 2>/dev/null || true
             git rm -rq --cached . 2>/dev/null || true
-            mv "${LOG}.gz" ci-build-2410.log.gz
+            mv "${BIG}.gz" ci-build-2410.log.gz
             git add -f ci-build-2410.log.gz
             git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "CI log (gzip) run ${{ github.run_id }}"
             git push -f origin HEAD:ci-log-2410 2>&1 | tail -3 || echo "推送 ci-log-2410 分支失败"
